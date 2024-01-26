@@ -124,7 +124,7 @@ func New(_ context.Context, next http.Handler, config *Config, name string) (htt
 		name:                 name,
 		parser:               jwt.NewParser(jwt.WithValidMethods(config.ValidMethods)),
 		secret:               secret,
-		issuers:              config.Issuers,
+		issuers:              canonicalizeDomains(config.Issuers),
 		require:              convertRequire(config.Require),
 		keys:                 make(map[string]interface{}),
 		issuerKeys:           make(map[string]map[string]interface{}),
@@ -371,6 +371,7 @@ func (plugin *JWTPlugin) GetKey(token *jwt.Token) (interface{}, error) {
 
 			issuer, ok := token.Claims.(jwt.MapClaims)["iss"].(string)
 			if ok {
+				issuer = canonicalizeDomain(issuer)
 				if plugin.IsValidIssuer(issuer) {
 					plugin.lock.Lock()
 					if _, ok := plugin.keys[kid.(string)]; !ok {
@@ -407,25 +408,49 @@ func (plugin *JWTPlugin) IsValidIssuer(issuer string) bool {
 
 // fetchKeys fetches the keys from well-known jwks endpoint for the given issuer and adds them to the key map.
 func (plugin *JWTPlugin) fetchKeys(issuer string) error {
-	jwks, err := FetchJWKS(issuer)
+	configURL := issuer + ".well-known/openid-configuration" // issuer has trailing slash
+	config, err := FetchOpenIDConfiguration(configURL)
+	if err != nil {
+		return err
+	}
+	log.Printf("fetched openid-configuration from url:%s", configURL)
+	url := config.JWKSURI
+
+	jwks, err := FetchJWKS(url)
 	if err != nil {
 		return err
 	}
 	for keyID, key := range jwks {
-		log.Printf("fetched key:%s from url:%s", keyID, issuer)
+		log.Printf("fetched key:%s from url:%s", keyID, url)
 		plugin.keys[keyID] = key
 	}
 
-	previous := plugin.issuerKeys[issuer]
+	previous := plugin.issuerKeys[url]
 	for keyID := range previous {
 		if _, ok := jwks[keyID]; !ok {
-			log.Printf("key:%s dropped by url:%s", keyID, issuer)
+			log.Printf("key:%s dropped by url:%s", keyID, url)
 			delete(plugin.keys, keyID)
 		}
 	}
-	plugin.issuerKeys[issuer] = jwks
+	plugin.issuerKeys[url] = jwks
 
 	return nil
+}
+
+// canonicalizeDomain adds a trailing slash to the domain
+func canonicalizeDomain(domain string) string {
+	if !strings.HasSuffix(domain, "/") {
+		domain += "/"
+	}
+	return domain
+}
+
+// canonicalizeDomains adds a trailing slash to all domains
+func canonicalizeDomains(domains []string) []string {
+	for index, domain := range domains {
+		domains[index] = canonicalizeDomain(domain)
+	}
+	return domains
 }
 
 // createTemplate creates a template from the given redirect string, or nil if no specified.
@@ -487,8 +512,8 @@ func (plugin *JWTPlugin) extractToken(request *http.Request) string {
 
 // extractTokenFromCookie extracts the token from the cookie. If the token is found, it is removed from the cookies unless forwardToken is true.
 func (plugin *JWTPlugin) extractTokenFromCookie(request *http.Request) string {
-	cookie, error := request.Cookie(plugin.cookieName)
-	if error != nil {
+	cookie, err := request.Cookie(plugin.cookieName)
+	if err != nil {
 		return ""
 	}
 	if !plugin.forwardToken {

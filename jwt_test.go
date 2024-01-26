@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -33,6 +34,7 @@ type Test struct {
 	ExpectHeaders     map[string]string
 	ExpectCookies     map[string]string
 	Config            string
+	URL               string
 	Keys              jose.JSONWebKeySet
 	Method            jwt.SigningMethod
 	CookieName        string
@@ -625,6 +627,32 @@ func TestServeHTTP(tester *testing.T) {
 			Actions:    map[string]string{"excludeIss": "yes"},
 		},
 		{
+			Name:   "wildcard isser",
+			Expect: http.StatusOK,
+			Config: `
+				issuers:
+				    - "http://127.0.0.1:*/"
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"noAddIsser": "yes"},
+		},
+		{
+			Name:   "bad wildcard isser",
+			Expect: http.StatusUnauthorized,
+			Config: `
+				issuers:
+				    - "http://example.com:*/"
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"noAddIsser": "yes"},
+		},
+		{
 			Name:   "key rotation",
 			Expect: http.StatusOK,
 			Config: `
@@ -636,7 +664,7 @@ func TestServeHTTP(tester *testing.T) {
 			Actions:    map[string]string{"rotateKey": "yes"},
 		},
 		{
-			Name:   "server internal error",
+			Name:   "config bad body",
 			Expect: http.StatusUnauthorized,
 			Config: `
 				require:
@@ -644,7 +672,51 @@ func TestServeHTTP(tester *testing.T) {
 			Claims:     `{"aud": "test"}`,
 			Method:     jwt.SigningMethodES256,
 			HeaderName: "Authorization",
-			Actions:    map[string]string{"serverStatus": "500"},
+			Actions:    map[string]string{"configBadBody": "yes"},
+		},
+		{
+			Name:   "keys bad url",
+			Expect: http.StatusUnauthorized,
+			Config: `
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"keysBadURL": "yes"},
+		},
+		{
+			Name:   "keys bad body",
+			Expect: http.StatusUnauthorized,
+			Config: `
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"keysBadBody": "yes"},
+		},
+		{
+			Name:   "config server internal error",
+			Expect: http.StatusUnauthorized,
+			Config: `
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"configServerStatus": "500"},
+		},
+		{
+			Name:   "keys server internal error",
+			Expect: http.StatusUnauthorized,
+			Config: `
+				require:
+					aud: test`,
+			Claims:     `{"aud": "test"}`,
+			Method:     jwt.SigningMethodES256,
+			HeaderName: "Authorization",
+			Actions:    map[string]string{"keysServerStatus": "500"},
 		},
 		{
 			Name:   "invalid json",
@@ -850,9 +922,9 @@ func setup(test *Test) (http.Handler, *http.Request, *httptest.Server, error) {
 		return nil, nil, nil, err
 	}
 
-	context := context.Background()
+	ctx := context.Background()
 
-	request, err := http.NewRequestWithContext(context, http.MethodGet, "https://app.example.com/home?id=1", nil)
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://app.example.com/home?id=1", nil)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -862,8 +934,13 @@ func setup(test *Test) (http.Handler, *http.Request, *httptest.Server, error) {
 	}
 
 	// Run a test server to provide the key(s)
-	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		if status, ok := test.Actions["serverStatus"]; ok {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/.well-known/jwks.json", func(response http.ResponseWriter, request *http.Request) {
+		if _, ok := test.Actions["keysBadBody"]; ok {
+			response.Header().Add("Content-Length", "1")
+			return
+		}
+		if status, ok := test.Actions["keysServerStatus"]; ok {
 			status, err := strconv.Atoi(status)
 			if err != nil {
 				panic(err)
@@ -873,18 +950,51 @@ func setup(test *Test) (http.Handler, *http.Request, *httptest.Server, error) {
 		} else {
 			response.WriteHeader(http.StatusOK)
 		}
-		keysJSON, err := json.Marshal(test.Keys)
+		payload, err := json.Marshal(test.Keys)
 		if err != nil {
 			panic(err)
 		}
 		if test.Actions != nil {
-			keysJSON, err = jsonActions(test.Actions, keysJSON)
+			payload, err = jsonActions(test.Actions, payload)
 			if err != nil {
 				panic(err)
 			}
 		}
-		fmt.Fprintln(response, string(keysJSON))
-	}))
+		_, _ = fmt.Fprintln(response, string(payload))
+	})
+	mux.HandleFunc("/.well-known/openid-configuration", func(response http.ResponseWriter, request *http.Request) {
+		if _, ok := test.Actions["configBadBody"]; ok {
+			response.Header().Add("Content-Length", "1")
+			return
+		}
+		if status, ok := test.Actions["configServerStatus"]; ok {
+			status, err := strconv.Atoi(status)
+			if err != nil {
+				panic(err)
+			}
+			response.WriteHeader(status)
+			return
+		} else {
+			response.WriteHeader(http.StatusOK)
+		}
+		var url string
+		if _, ok := test.Actions["keysBadURL"]; ok {
+			url = "https://dummy.example.com"
+		} else {
+			url = test.URL
+		}
+		config := OpenIDConfiguration{
+			JWKSURI: url + "/.well-known/jwks.json",
+		}
+		payload, err := json.Marshal(config)
+		if err != nil {
+			panic(err)
+		}
+		_, _ = fmt.Fprintln(response, string(payload))
+	})
+	server := httptest.NewServer(mux)
+	test.URL = server.URL
+
 	if _, present := test.Actions["noAddIsser"]; !present {
 		config.Issuers = append(config.Issuers, server.URL)
 	}
@@ -895,7 +1005,7 @@ func setup(test *Test) (http.Handler, *http.Request, *httptest.Server, error) {
 
 	// Create the plugin
 	next := http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) { test.Result = true })
-	plugin, err := New(context, next, config, "test-jwt-middleware")
+	plugin, err := New(ctx, next, config, "test-jwt-middleware")
 	if err != nil {
 		if err.Error() == test.ExpectPluginError {
 			return nil, nil, nil, nil
@@ -1053,6 +1163,28 @@ func convertKeyToJWKWithKID(key interface{}, algorithm string) (jose.JSONWebKey,
 	}
 	jwk.KeyID = base64.RawURLEncoding.EncodeToString(bytes)
 	return jwk, jwk.KeyID
+}
+
+func TestCanonicalizeDomains(tester *testing.T) {
+	tests := []struct {
+		Name     string
+		domains  []string
+		expected []string
+	}{
+		{
+			Name:     "Default",
+			domains:  []string{"https://example.com", "example.org/"},
+			expected: []string{"https://example.com/", "example.org/"},
+		},
+	}
+	for _, test := range tests {
+		tester.Run(test.Name, func(tester *testing.T) {
+			result := canonicalizeDomains(test.domains)
+			if !reflect.DeepEqual(result, test.expected) {
+				tester.Errorf("got: %s expected: %s", result, test.expected)
+			}
+		})
+	}
 }
 
 func BenchmarkServeHTTP(benchmark *testing.B) {
