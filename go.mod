@@ -1,4 +1,4 @@
-module github.com/tpaulus/jwt-middleware
+module github.com/thinkberg/jwt-middleware
 
 go 1.20
 
@@ -11,4 +11,4 @@ require (
 	gopkg.in/yaml.v3 v3.0.1
 )
 
-require golang.org/x/crypto v0.12.0 // indirect
+require golang.org/x/crypto v0.18.0 // indirect
